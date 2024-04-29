@@ -1,0 +1,236 @@
+---
+title: "Final.Project"
+format: html
+editor: visual
+author: José L. Alvarado
+---
+
+## Loading the proper packages
+
+```{r message=FALSE, warning=FALSE}
+library(matrixStats)
+library(caret)
+library(umap)
+library(ggplot2)
+library(dplyr)
+library(class)
+library(rpart)
+library(randomForest)
+```
+
+## Loading and understanding the data
+
+We begin exploring and making sense of the data.
+
+```{r}
+
+data("pbmc_facs", package = "fastTopics") #The database
+
+x <- as.matrix(pbmc_facs$counts) #creating a matrix of the predictors
+y <- pbmc_facs$samples$celltype #creating a vector of the labels
+
+class(x)
+class(y)
+
+
+dim(x) 
+
+length(y)
+levels(y)
+
+100*(mean(x == 0)) #To determine the amount of "zeros"
+
+```
+
+We see the following:
+
+a)  x is a matrix of 3774 cells & 16791 genes. This is a gene expression matrix.
+
+b)  y is a vector of 3774 factors. The factors are 10 different cell types. Therefore, y labels each of the 3774 cells with one of the 10 cell types.
+
+c)  95.73% of counts is "0". The 4.27% of non-zero data are UMI's (UMI = Unique Molecular Identifier).
+
+## Now let's do some data visualization
+
+
+```{r}
+
+hist(colMeans(x), breaks=100, main="Histogram of Average Gene Expression per Cell", xlab="Average Expression")
+
+# Calculate total counts per cell
+total_counts <- rowSums(x)
+
+# Prepare data for ggplot
+data_for_plot <- data.frame(TotalCounts = total_counts, CellType = y)
+
+# Create the boxplot
+ggplot(data_for_plot, aes(x = CellType, y = TotalCounts, fill = CellType)) +
+  geom_boxplot() +
+  scale_fill_viridis_d() +
+  theme_minimal() +
+  ggtitle("Distribution of Total Gene Expression Counts by Cell Type") +
+  xlab("Cell Type") +
+  ylab("Total Gene Expression Counts") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+The distribution shows count data & a big amount of "zeroes" (we already know it's 95.73%) which suggests a "zero inflated model" (I will not do a goodness of fit test, but it would be the way to test this hypothesis). This is problematic, as this distribution accounts for two models: 1 model for the distribution of zeroes and 1 model for the rest of the data. Doing regression on this, therefore, would be problematic and other approaches could be preferred.
+
+The boxplot shows that CD34+ cells has a median count significantly higher than the other cell types, with a high level of variability within this group. In contrast, CD14+ Monocyte cell type exhibits the lowest median counts and few outliers, and also shows less within variability.
+
+
+Now, for computational efficiency, we'll do partition of the cores to run annalysis in parallel.
+```{r}
+library(parallel)
+library(doParallel)
+nc <- detectCores()  - 1
+cl <- makeCluster(nc) # convention to leave 1 core for OS
+registerDoParallel(cl)
+```
+## Data partition
+
+Our data matrix is of dimensions: 3774 cells & 16791 genes (3774 x 16791), meaning 63,369,234 features.
+To train a model, we must do so only in a subset of the data (the training set) and then we test it in the remaining data (the test set). This as a validation analysis. The training of the model cannot be done with any of the test set data (this is known as data leakage) as we aim to predict in the test set with the model we built with the training data.
+For computational power reasons, we create a training set that includes 18% of the totality of the data.
+
+```{r}
+index <- createDataPartition(y, p = 0.18, list = FALSE)
+x <- x[index,]
+y <- factor(y[index])
+
+x_test <- x[-index, ]
+y_test <- factor(y[-index])
+```
+
+```{r}
+pca <- prcomp(x, rank. = 100)
+p <- which(summary(pca)$importance[3,] > 0.70)[1]
+print(p)
+
+set.seed(123)
+k_values <- data.frame(k = seq(1, 21, 2))
+
+
+fit_knn_pca <- train(x, y, method = "knn", 
+      tuneGrid = data.frame(k = k_values),
+      preProcess = c("nzv", "pca"),
+      trControl = trainControl(method = "cv", p = 0.95, number = 10,
+                               preProcOptions = list(pcaComp = p)))
+plot(fit_knn_pca$results)
+y_hat_knn_pca <- predict(fit_knn_pca, newdata = x_test, type = "raw")
+mean(y_hat_knn_pca == y_test)
+confusionMatrix(y_test, y_hat_knn_pca)
+```
+
+The accuracy is around 60%, not the best outcome. We see we get larger specificity (96%) and negative predictive value (95%) and lower sensitivity (36%) and positive predictive value(42%).
+
+Now, the plot. Every concept is distributed in rows:
+
+a) k vs. Accuracy: Shows how the accuracy of the model changes with different values of k. There isn't a clear trend visible, suggesting that accuracy doesn't improve consistently with higher or lower k values.
+
+b) k vs. Kappa: Kappa is another metric for classification performance that accounts for chance agreement. This plot again doesn't show a clear relationship between k and Kappa.
+
+c) k vs. AccuracySD: This plots the standard deviation of the accuracy against k, which gives an idea about the variability of the model performance for different k values.
+
+d) k vs. KappaSD: Similarly, this shows the variability in Kappa statistic for different values of k.
+
+e) Accuracy vs. Kappa: Shows the relationship between accuracy and kappa, which seem to be positively correlated as expected since they are both measures of classification performance.
+
+f) AccuracySD vs. KappaSD: Illustrates the relationship between the variability of accuracy and kappa. A lack of a clear pattern would suggest that the stability of the model performance in terms of accuracy does not necessarily correlate with the stability of the kappa statistic.
+
+We can try different methodologies & compare.
+
+## Random forest approach
+
+We will do it from scratch
+```{r}
+data("pbmc_facs", package = "fastTopics") #The database
+
+x <- as.matrix(pbmc_facs$counts) #creating a matrix of the predictors
+y <- pbmc_facs$samples$celltype #creating a vector of the labels
+
+# First, create a partition to split the data
+index <- createDataPartition(y, p = 0.18, list = FALSE)
+
+# Split the data into training and test sets
+x_train <- x[index, ]
+y_train <- factor(y[index])
+x_test <- x[-index, ]
+y_test <- factor(y[-index])
+
+# Apply preprocessing to the training set only
+prep_rf <- preProcess(x_train, method = c("nzv", "pca"), thresh = 0.50)
+x_train_pca <- predict(prep_rf, x_train)
+
+set.seed(123)
+# Train the model on the preprocessed training data
+rf_model <- train(x_train_pca, y_train, method = "rf", trControl = trainControl(method = "cv", number = 10), ntree = 200)
+
+# Now, preprocess the test set with the same transformation as the training set
+x_test_pca <- predict(prep_rf, x_test)
+
+# Finally, predict and evaluate the model on the test set
+predictions <- predict(rf_model, x_test_pca)
+conf_mat <- confusionMatrix(predictions, y_test)
+print(conf_mat)
+```
+
+We now obtain an accuracy of 79.93%, much better that the one we obtained with the knn model.
+
+## The function
+
+Finally, now that we have selected our model, we create the function to simplify the process
+
+```{r}
+run_random_forest <- function(x, y, partition_size = 0.18, pca_thresh = 0.50, ntree = 150, cv_folds = 10) {
+  # Load libraries
+  library(caret)
+  library(randomForest)
+  
+  # Partition the data
+  set.seed(123) # for reproducibility
+  index <- createDataPartition(y, p = partition_size, list = FALSE)
+  x_train <- x[index, ]
+  y_train <- factor(y[index])
+  x_test <- x[-index, ]
+  y_test <- factor(y[-index])
+  
+  # Preprocess the training set
+  prep_rf <- preProcess(x_train, method = c("nzv", "pca"), thresh = pca_thresh)
+  x_train_pca <- predict(prep_rf, x_train)
+  
+  # Train the Random Forest model
+  train_cont <- trainControl(method = "cv", number = cv_folds)
+  rf_model <- train(x_train_pca, y_train, method = "rf", trControl = train_cont, ntree = ntree)
+  
+  # Transform the test set
+  x_test_pca <- predict(prep_rf, x_test)
+  
+  # Make predictions and evaluate the model
+  predictions <- predict(rf_model, x_test_pca)
+  conf_mat <- confusionMatrix(predictions, y_test)
+  
+  # Return the model, the confusion matrix, and predictions
+  list(
+    model = rf_model,
+    confusion_matrix = conf_mat,
+    predictions = predictions
+  )
+}
+
+# You would call the function like this:
+results <- run_random_forest(x, y)
+
+```
+
+
+
+```{r}
+stopCluster(cl)
+stopImplicitCluster()
+```
+
+
+
