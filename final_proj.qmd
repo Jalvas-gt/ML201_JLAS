@@ -80,8 +80,42 @@ The distribution shows count data & a big amount of "zeroes" (we already know it
 
 The boxplot shows that CD34+ cells has a median count significantly higher than the other cell types, with a high level of variability within this group. In contrast, CD14+ Monocyte cell type exhibits the lowest median counts and few outliers, and also shows less within variability.
 
+## Data transformation
 
-Now, for computational efficiency, we'll do partition of the cores to run annalysis in parallel.
+Given what we have seen, it makes sense to transform the data to obtain a more favorable distribution.
+
+```{r}
+nz <- x == 0
+
+# Let's compute residuals (errors)
+n_i <- rowSums(x)
+m_j <- colSums(x)/sum(n_i)
+m_ij <- outer(n_i, m_j, FUN = "*") 
+
+# Pearson residuals
+r <- (x - m_ij)/sqrt(m_ij)
+
+r <- sign(x - m_ij)*sqrt(2*(x*log(x/m_ij) - (x - m_ij)))
+r[nz] <- -sqrt(2*m_ij[nz])
+hist(r[,10548], nc= 100)
+
+
+
+index <- createDataPartition(y, p = 0.18, list = FALSE)
+col_ind <- order(-colSds(r))[1:500]
+
+
+x_test <- r[test_ind, col_ind]
+y_test <-  pbmc_facs$samples$celltype[test_ind]
+
+x <- r[-test_ind, col_ind]
+y <- pbmc_facs$samples$celltype[-test_ind]
+```
+
+Plotting the residuals gives us another perspective. We now have a distribution that resembles normal.
+
+
+Now, for computational efficiency, we'll do partition of the cores to run analysis in parallel.
 ```{r}
 library(parallel)
 library(doParallel)
@@ -93,38 +127,25 @@ registerDoParallel(cl)
 
 Our data matrix is of dimensions: 3774 cells & 16791 genes (3774 x 16791), meaning 63,369,234 features.
 To train a model, we must do so only in a subset of the data (the training set) and then we test it in the remaining data (the test set). This as a validation analysis. The training of the model cannot be done with any of the test set data (this is known as data leakage) as we aim to predict in the test set with the model we built with the training data.
-For computational power reasons, we create a training set that includes 18% of the totality of the data.
+
+For computational power reasons, we create a training set that includes 18% of the totality of the data. We will work with the transformed data.
 
 ```{r}
-index <- createDataPartition(y, p = 0.18, list = FALSE)
-x <- x[index,]
-y <- factor(y[index])
+pc <- prcomp(x, rank. = 200)
+summary(pc) #We see that the first 200 PCs explain ~ 75% of the variance
 
-x_test <- x[-index, ]
-y_test <- factor(y[-index])
-```
+fit_knn <- train(pc$x, y, method = "knn",
+                 tuneGrid = data.frame(k = seq(1,7,2)),
+                 trControl = trainControl("cv", number = 20, p = 0.95))
 
-```{r}
-pca <- prcomp(x, rank. = 100)
-p <- which(summary(pca)$importance[3,] > 0.70)[1]
-print(p)
-
-set.seed(123)
-k_values <- data.frame(k = seq(1, 21, 2))
-
-
-fit_knn_pca <- train(x, y, method = "knn", 
-      tuneGrid = data.frame(k = k_values),
-      preProcess = c("nzv", "pca"),
-      trControl = trainControl(method = "cv", p = 0.95, number = 10,
-                               preProcOptions = list(pcaComp = p)))
+plot(fit_knn)
+y_hat <- predict(fit_knn, newdata = sweep(x_test, 2, colMeans(x)) %*% pc$rotation)
+mean(y_hat == y_test)
 plot(fit_knn_pca$results)
-y_hat_knn_pca <- predict(fit_knn_pca, newdata = x_test, type = "raw")
-mean(y_hat_knn_pca == y_test)
-confusionMatrix(y_test, y_hat_knn_pca)
+confusionMatrix(y_test, y_hat)
 ```
 
-The accuracy is around 60%, not the best outcome. We see we get larger specificity (96%) and negative predictive value (95%) and lower sensitivity (36%) and positive predictive value(42%).
+The accuracy is around 70% (IC 0.35 - 0.93), not the best outcome.
 
 Now, the plot. Every concept is distributed in rows:
 
@@ -144,46 +165,29 @@ We can try different methodologies & compare.
 
 ## Random forest approach
 
-We will do it from scratch
+We won't do it from scratch, we'll keep the normalized data
 ```{r}
-data("pbmc_facs", package = "fastTopics") #The database
+fit_rf <- train(x, y, method = "rf",
+                tuneGrid = data.frame(mtry = seq(5, 15, 3)),
+                trControl = trainControl("cv", number = 10, p = 0.9))
 
-x <- as.matrix(pbmc_facs$counts) #creating a matrix of the predictors
-y <- pbmc_facs$samples$celltype #creating a vector of the labels
 
-# First, create a partition to split the data
-index <- createDataPartition(y, p = 0.18, list = FALSE)
+plot(fit_rf)
 
-# Split the data into training and test sets
-x_train <- x[index, ]
-y_train <- factor(y[index])
-x_test <- x[-index, ]
-y_test <- factor(y[-index])
+fit_rf <- randomForest(x, y, mtry = 15)
+y_hat <- predict(fit_rf, newdata = x_test)
+mean(y_hat == y_test)
 
-# Apply preprocessing to the training set only
-prep_rf <- preProcess(x_train, method = c("nzv", "pca"), thresh = 0.50)
-x_train_pca <- predict(prep_rf, x_train)
-
-set.seed(123)
-# Train the model on the preprocessed training data
-rf_model <- train(x_train_pca, y_train, method = "rf", trControl = trainControl(method = "cv", number = 10), ntree = 200)
-
-# Now, preprocess the test set with the same transformation as the training set
-x_test_pca <- predict(prep_rf, x_test)
-
-# Finally, predict and evaluate the model on the test set
-predictions <- predict(rf_model, x_test_pca)
-conf_mat <- confusionMatrix(predictions, y_test)
-print(conf_mat)
 ```
 
-We now obtain an accuracy of 79.93%, much better that the one we obtained with the knn model.
+We now obtain an accuracy ~ 90%, much better that the one we obtained with the knn model.
 
 ## The function
 
-Finally, now that we have selected our model, we create the function to simplify the process
+Finally, now that we have selected our model, we create a function that mimics the process. Worth noting, the normalization of the data needs to be done ahead of running this function, but it woukd be propper to do so after doing exploratory data analysis.
 
 ```{r}
+
 run_random_forest <- function(x, y, partition_size = 0.18, pca_thresh = 0.50, ntree = 150, cv_folds = 10) {
   # Load libraries
   library(caret)
@@ -212,7 +216,7 @@ run_random_forest <- function(x, y, partition_size = 0.18, pca_thresh = 0.50, nt
   predictions <- predict(rf_model, x_test_pca)
   conf_mat <- confusionMatrix(predictions, y_test)
   
-  # Return the model, the confusion matrix, and predictions
+  # Return the model, confusion matrix, and predictions
   list(
     model = rf_model,
     confusion_matrix = conf_mat,
@@ -224,13 +228,93 @@ run_random_forest <- function(x, y, partition_size = 0.18, pca_thresh = 0.50, nt
 results <- run_random_forest(x, y)
 
 ```
+ 
+Other approach is to do it in two different functions. Let's see:
 
+```{r}
+# We'll create two functions. 
+
+# Function 01: Model training function
+train_random_forest <- function(x, y, partition_size = 0.18, pca_thresh = 0.50, ntree = 150, cv_folds = 10) {                                 #you can change the partition if considered neccesary
+  library(caret)
+  library(randomForest)
+
+  # Partition the data
+  set.seed(123)  # for reproducibility
+  index <- createDataPartition(y, p = partition_size, list = FALSE)
+  x_train <- x[index, ]
+  y_train <- factor(y[index])
+  x_test <- x[-index, ]
+  y_test <- factor(y[-index])
+
+  # Preprocess the training set
+  prep_rf <- preProcess(x_train, method = c("nzv", "pca"), thresh = pca_thresh)
+  x_train_pca <- predict(prep_rf, x_train)
+
+  # Train the Random Forest model
+  train_cont <- trainControl(method = "cv", number = cv_folds)
+  rf_model <- train(x_train_pca, y_train, method = "rf", trControl = train_cont, ntree = ntree)
+
+  # Save the trained model and preprocessing object
+  saveRDS(rf_model, "rf_model.rds")
+  saveRDS(prep_rf, "prep_rf.rds")
+
+  # Transform the test set
+  x_test_pca <- predict(prep_rf, x_test)
+
+  # Make predictions and evaluate the model
+  predictions <- predict(rf_model, x_test_pca)
+  conf_mat <- confusionMatrix(predictions, y_test)
+
+  # Return the model, the confusion matrix, and predictions
+  list(
+    model = rf_model,
+    preprocessing = prep_rf,
+    confusion_matrix = conf_mat,
+    predictions = predictions
+  )
+}
+
+#Function 02: the prediction function
+
+predict_cell_type <- function(gene_expression_vector) {
+  # Load the model and preprocessing object
+  rf_model <- readRDS("rf_model.rds")
+  prep_rf <- readRDS("prep_rf.rds")
+
+  # Ensure the input is a matrix and apply the preprocessing
+  gene_expression_matrix <- as.matrix(t(gene_expression_vector))
+  gene_expression_pca <- predict(prep_rf, gene_expression_matrix)
+
+  # Predict the cell type
+  predicted_cell_type <- predict(rf_model, gene_expression_pca)
+
+  return(predicted_cell_type)
+}
+
+#Now, the use of the function: (`x` and `y` are loaded and preprocessed)
+training_results <- train_random_forest(x, y)
+# Example gene expression vector. Make sure it matches trained genes
+new_gene_expression <- c(gene1 = 123, gene2 = 456, gene3 = 789, ...)  # 
+
+# Predict the cell type
+predicted_type <- predict_cell_type(new_gene_expression)
+print(predicted_type)
+
+
+#It is worth noting, good understanding of the data set is a prerequisite.
+```
+
+So, what do these functions do?
+
+These functions are designed to simplify the process of training a Random Forest model and using it to predict cell types from gene expression data.
+
+Function 01: first step in the workflow. Responsible for building the predictive model. It begins by dividing the provided gene expression data (x) and the corresponding cell types (y) into two sets: one for training the model and the other for testing its accuracy. During training, it preprocesses the data to remove less informative features (nzv = "near zero variance") and reduces dimensionality through Principal Component Analysis (PCA), which simplifies the data while retaining essential information (variance). Then, it trains the Random Forest (RF) model, which is about creating multiple decision trees to make predictions. Then, the function evaluates the model's performance using the test data, looking into how well the model might perform on unseen data.
+
+Function 02: now with the trained model, this function predicts the cell type of new gene expression samples. It takes a vector of gene expression values as input, applies the same preprocessing transformations as were used during the training (PCA), and then uses the trained RF model to predict the cell type.
 
 
 ```{r}
 stopCluster(cl)
 stopImplicitCluster()
 ```
-
-
-
